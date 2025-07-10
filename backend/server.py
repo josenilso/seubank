@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -47,12 +47,17 @@ class AccountType(str, enum.Enum):
     CHECKING = "checking"
     SAVINGS = "savings"
 
+class UserRole(str, enum.Enum):
+    USER = "user"
+    ADMIN = "admin"
+
 # Models
 class User(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     email: str
     full_name: str
     phone: str
+    role: UserRole = UserRole.USER
     created_at: datetime = Field(default_factory=datetime.utcnow)
     is_active: bool = True
 
@@ -61,6 +66,20 @@ class UserCreate(BaseModel):
     password: str
     full_name: str
     phone: str
+    role: UserRole = UserRole.USER
+
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    is_active: Optional[bool] = None
+    role: Optional[UserRole] = None
+
+class AdminUserCreate(BaseModel):
+    email: str
+    password: str
+    full_name: str
+    phone: str
+    role: UserRole
 
 class UserLogin(BaseModel):
     email: str
@@ -104,6 +123,20 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
+class AdminStats(BaseModel):
+    total_users: int
+    total_accounts: int
+    total_transactions: int
+    total_balance: float
+    active_users: int
+    recent_transactions: int
+
+class UserWithAccounts(BaseModel):
+    user: User
+    accounts: List[Account]
+    total_balance: float
+    transaction_count: int
+
 # Helper Functions
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
@@ -134,6 +167,34 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid authentication credentials")
 
+async def get_current_admin(current_user: User = Depends(get_current_user)):
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
+# Create default admin user on startup
+async def create_default_admin():
+    admin_email = "admin@seubank.com"
+    existing_admin = await db.users.find_one({"email": admin_email})
+    
+    if not existing_admin:
+        admin_data = {
+            "email": admin_email,
+            "password": "admin123",
+            "full_name": "SeuBank Administrator",
+            "phone": "+55 11 99999-0000",
+            "role": UserRole.ADMIN
+        }
+        
+        hashed_password = hash_password(admin_data["password"])
+        user_dict = admin_data.copy()
+        user_dict.pop("password")
+        user_dict["hashed_password"] = hashed_password
+        user_obj = User(**user_dict)
+        
+        await db.users.insert_one(user_obj.dict())
+        print(f"✅ Default admin created: {admin_email} / admin123")
+
 # Auth Routes
 @api_router.post("/auth/register", response_model=Token)
 async def register(user_data: UserCreate):
@@ -151,9 +212,10 @@ async def register(user_data: UserCreate):
     
     await db.users.insert_one(user_obj.dict())
     
-    # Create default checking account
-    account = Account(user_id=user_obj.id, account_type=AccountType.CHECKING)
-    await db.accounts.insert_one(account.dict())
+    # Create default checking account for regular users
+    if user_obj.role == UserRole.USER:
+        account = Account(user_id=user_obj.id, account_type=AccountType.CHECKING)
+        await db.accounts.insert_one(account.dict())
     
     # Create access token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -310,9 +372,158 @@ async def transfer_money(transfer_data: TransferRequest, current_user: User = De
 async def get_profile(current_user: User = Depends(get_current_user)):
     return current_user
 
+# Admin Routes
+@api_router.get("/admin/stats", response_model=AdminStats)
+async def get_admin_stats(current_admin: User = Depends(get_current_admin)):
+    # Get statistics
+    total_users = await db.users.count_documents({})
+    total_accounts = await db.accounts.count_documents({})
+    total_transactions = await db.transactions.count_documents({})
+    active_users = await db.users.count_documents({"is_active": True})
+    
+    # Get recent transactions count (last 7 days)
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    recent_transactions = await db.transactions.count_documents({"timestamp": {"$gte": seven_days_ago}})
+    
+    # Calculate total balance across all accounts
+    accounts = await db.accounts.find({}).to_list(1000)
+    total_balance = sum(account["balance"] for account in accounts)
+    
+    return AdminStats(
+        total_users=total_users,
+        total_accounts=total_accounts,
+        total_transactions=total_transactions,
+        total_balance=total_balance,
+        active_users=active_users,
+        recent_transactions=recent_transactions
+    )
+
+@api_router.get("/admin/users", response_model=List[UserWithAccounts])
+async def get_all_users(current_admin: User = Depends(get_current_admin)):
+    users = await db.users.find({}).to_list(1000)
+    result = []
+    
+    for user_data in users:
+        user = User(**user_data)
+        # Get user's accounts
+        accounts = await db.accounts.find({"user_id": user.id}).to_list(100)
+        accounts_list = [Account(**account) for account in accounts]
+        
+        # Calculate total balance
+        total_balance = sum(account.balance for account in accounts_list)
+        
+        # Get transaction count
+        transaction_count = await db.transactions.count_documents({"user_id": user.id})
+        
+        result.append(UserWithAccounts(
+            user=user,
+            accounts=accounts_list,
+            total_balance=total_balance,
+            transaction_count=transaction_count
+        ))
+    
+    return result
+
+@api_router.get("/admin/users/{user_id}", response_model=UserWithAccounts)
+async def get_user_by_id(user_id: str, current_admin: User = Depends(get_current_admin)):
+    user_data = await db.users.find_one({"id": user_id})
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user = User(**user_data)
+    # Get user's accounts
+    accounts = await db.accounts.find({"user_id": user.id}).to_list(100)
+    accounts_list = [Account(**account) for account in accounts]
+    
+    # Calculate total balance
+    total_balance = sum(account.balance for account in accounts_list)
+    
+    # Get transaction count
+    transaction_count = await db.transactions.count_documents({"user_id": user.id})
+    
+    return UserWithAccounts(
+        user=user,
+        accounts=accounts_list,
+        total_balance=total_balance,
+        transaction_count=transaction_count
+    )
+
+@api_router.put("/admin/users/{user_id}", response_model=User)
+async def update_user(user_id: str, user_update: UserUpdate, current_admin: User = Depends(get_current_admin)):
+    user_data = await db.users.find_one({"id": user_id})
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Update user data
+    update_data = {k: v for k, v in user_update.dict().items() if v is not None}
+    if update_data:
+        await db.users.update_one({"id": user_id}, {"$set": update_data})
+    
+    # Return updated user
+    updated_user = await db.users.find_one({"id": user_id})
+    return User(**updated_user)
+
+@api_router.delete("/admin/users/{user_id}")
+async def delete_user(user_id: str, current_admin: User = Depends(get_current_admin)):
+    user_data = await db.users.find_one({"id": user_id})
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Don't allow deletion of admin users
+    if user_data.get("role") == UserRole.ADMIN:
+        raise HTTPException(status_code=400, detail="Cannot delete admin users")
+    
+    # Delete user's accounts and transactions
+    await db.accounts.delete_many({"user_id": user_id})
+    await db.transactions.delete_many({"user_id": user_id})
+    
+    # Delete user
+    await db.users.delete_one({"id": user_id})
+    
+    return {"message": "User deleted successfully"}
+
+@api_router.post("/admin/users", response_model=User)
+async def create_user_admin(user_data: AdminUserCreate, current_admin: User = Depends(get_current_admin)):
+    # Check if user already exists
+    existing_user = await db.users.find_one({"email": user_data.email})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Create new user
+    hashed_password = hash_password(user_data.password)
+    user_dict = user_data.dict()
+    user_dict.pop("password")
+    user_dict["hashed_password"] = hashed_password
+    user_obj = User(**user_dict)
+    
+    await db.users.insert_one(user_obj.dict())
+    
+    # Create default checking account for regular users
+    if user_obj.role == UserRole.USER:
+        account = Account(user_id=user_obj.id, account_type=AccountType.CHECKING)
+        await db.accounts.insert_one(account.dict())
+    
+    return user_obj
+
+@api_router.get("/admin/transactions", response_model=List[Transaction])
+async def get_all_transactions(
+    current_admin: User = Depends(get_current_admin),
+    limit: int = Query(100, le=1000),
+    skip: int = Query(0, ge=0)
+):
+    transactions = await db.transactions.find({}).sort("timestamp", -1).skip(skip).limit(limit).to_list(limit)
+    return [Transaction(**transaction) for transaction in transactions]
+
+@api_router.get("/admin/transactions/{transaction_id}", response_model=Transaction)
+async def get_transaction_by_id(transaction_id: str, current_admin: User = Depends(get_current_admin)):
+    transaction = await db.transactions.find_one({"id": transaction_id})
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return Transaction(**transaction)
+
 @api_router.get("/")
 async def root():
-    return {"message": "SeuBank API - Professional Banking Platform"}
+    return {"message": "SeuBank API - Professional Banking Platform with Admin Panel"}
 
 # Include the router in the main app
 app.include_router(api_router)
@@ -331,6 +542,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+@app.on_event("startup")
+async def startup_event():
+    await create_default_admin()
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
