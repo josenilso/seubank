@@ -222,12 +222,10 @@ metadata:
 
 test_plan:
   current_focus:
-    - "User Authentication System"
-    - "Account Management System"
-    - "Transaction Processing System"
     - "Authentication UI (Login/Register)"
     - "Banking Dashboard"
     - "Transaction Management Interface"
+    - "Account Management Interface"
   stuck_tasks: []
   test_all: true
   test_priority: "high_first"
